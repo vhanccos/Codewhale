@@ -4052,9 +4052,7 @@ fn resolve_credential_diagnostic(config: &Config) -> CredentialDiagnostic {
     }
     if !crate::config::auth_mode_requires_api_key(auth_mode.as_deref())
         && (crate::config::provider_route_is_keyless_self_hosted(provider, &base_url)
-            || crate::config::base_url_uses_local_host(&base_url)
-            || (provider == crate::config::ApiProvider::OpencodeZen
-                && !config.provider_uses_custom_endpoint(provider)))
+            || crate::config::base_url_uses_local_host(&base_url))
     {
         return CredentialDiagnostic::new(
             ApiKeySource::LocalRuntime,
