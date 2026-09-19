@@ -12243,6 +12243,10 @@ impl Config {
 /// this up," so a self-hosted provider only qualifies via an explicit
 /// `[providers.<name>]` entry or being active, never via `has_key` alone
 /// (otherwise every self-hosted provider type would always show up).
+/// OpenCode Zen follows the same rule for its keyless free tier: routable
+/// without a key, but configured only when active or explicitly set up —
+/// otherwise it would shadow explicitly credentialed providers that serve
+/// the same models.
 #[must_use]
 pub(crate) fn provider_is_configured(
     provider: ApiProvider,
@@ -12261,7 +12265,7 @@ pub(crate) fn provider_is_configured(
     if configured.is_some_and(provider_config_is_explicit) {
         return true;
     }
-    if provider.is_self_hosted() {
+    if provider.is_self_hosted() || provider == ApiProvider::OpencodeZen {
         return false;
     }
     has_key

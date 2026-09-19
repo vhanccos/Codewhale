@@ -284,18 +284,6 @@ pub(crate) fn resolve_credential_source_with(
     if user_global_config_api_key(provider).is_some() {
         return CredentialResolution::found(CredentialSource::UserGlobalConfig);
     }
-    // OpenCode Zen serves a keyless free tier on its official endpoint, so a
-    // missing key is a usable route, not a gap. This stays last so a stored
-    // key still resolves (and reports) from its real source above; an
-    // explicit API-key auth contract or a custom endpoint keeps requiring one.
-    if provider == ApiProvider::OpencodeZen
-        && !auth_mode_requires_api_key(auth_mode.as_deref())
-        && !config.provider_uses_custom_endpoint(provider)
-    {
-        return CredentialResolution::found(CredentialSource::KeylessRoute {
-            base_url: config.base_url_for_route(provider),
-        });
-    }
     probed.push(CredentialProbe::with_fix(
         "~/.codewhale/config.toml",
         format!("codewhale auth set --provider {}", provider.as_str()),
@@ -613,25 +601,20 @@ mod tests {
         );
     }
 
-    /// The official Zen endpoint serves a keyless free tier: with no key
-    /// anywhere, the route resolves as usable rather than missing. A stored
-    /// key still wins (and reports its real source) because this fallback
-    /// runs after every credential source.
+    /// Anonymous Zen is not a credential: with no key anywhere the route
+    /// resolves as missing, so an unconfigured Zen never outranks explicitly
+    /// credentialed providers that serve the same models. The keyless free
+    /// tier runs through explicit selection, where the request path resolves
+    /// an empty key instead of failing.
     #[test]
-    fn opencode_zen_without_any_credential_resolves_keyless_on_official_endpoint() {
+    fn opencode_zen_without_any_credential_stays_missing() {
         let _lock = lock_test_env();
         let home = tempfile::tempdir().expect("credential fixture");
         let _home = EnvVarGuard::set("CODEWHALE_HOME", home.path());
         let ctx = MapAuthContext::new();
         let config = Config::default();
         let resolution = resolve_credential_source_with(&config, ApiProvider::OpencodeZen, &ctx);
-        assert!(resolution.is_present());
-        assert_eq!(
-            resolution.source,
-            CredentialSource::KeylessRoute {
-                base_url: config.base_url_for_route(ApiProvider::OpencodeZen),
-            }
-        );
+        assert!(!resolution.is_present());
     }
 
     /// An explicit API-key auth contract opts back into failing loud.

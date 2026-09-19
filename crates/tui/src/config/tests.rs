@@ -844,8 +844,10 @@ fn opencode_zen_missing_credentials_never_mentions_codex_oauth() -> Result<()> {
 #[test]
 fn opencode_zen_active_route_without_key_resolves_empty_key() -> Result<()> {
     // The official Zen endpoint serves a keyless free tier: with no key
-    // anywhere, the route resolves to an empty key (the client then omits
-    // the Authorization header) instead of failing.
+    // anywhere, the active route resolves to an empty key (the client then
+    // omits the Authorization header) instead of failing. Absence of a key
+    // still reports as no credential, so an unconfigured Zen never outranks
+    // explicitly credentialed providers that serve the same models.
     let _lock = lock_test_env();
     let home = tempfile::tempdir().unwrap();
     let _home = EnvVarGuard::set("CODEWHALE_HOME", home.path());
@@ -857,8 +859,8 @@ fn opencode_zen_active_route_without_key_resolves_empty_key() -> Result<()> {
     };
     assert_eq!(config.active_route_api_key()?, "");
     assert!(
-        has_api_key_for(&config, ApiProvider::OpencodeZen),
-        "a keyless Zen route still counts as credentialed"
+        !has_api_key_for(&config, ApiProvider::OpencodeZen),
+        "a keyless Zen route stays uncredentialed for routing and picker purposes"
     );
     Ok(())
 }
