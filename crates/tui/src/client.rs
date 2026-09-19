@@ -2012,8 +2012,7 @@ static OPENCODE_SESSION: OnceLock<String> = OnceLock::new();
 /// (a UUID v4, for example). Randomness comes from a UUID v4 instead of
 /// `Math.random` so no new dependency is needed.
 fn generate_opencode_session_id() -> String {
-    const ALPHABET: &[u8; 62] =
-        b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    const ALPHABET: &[u8; 62] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as u64)
@@ -2996,8 +2995,7 @@ impl CodewhaleClient {
                     max_tokens,
                 ))
                 .await?;
-            let usage =
-                (response.usage != Usage::default()).then_some(response.usage.clone());
+            let usage = (response.usage != Usage::default()).then_some(response.usage.clone());
             let translated =
                 if codewhale_models::is_incomplete_stop_reason(response.stop_reason.as_deref()) {
                     Err(anyhow::anyhow!(
@@ -10171,8 +10169,8 @@ mod tests {
         let requests = server.received_requests().await.expect("recorded request");
         assert_eq!(requests.len(), 1);
         let body: Value = serde_json::from_slice(&requests[0].body).expect("request JSON");
-        assert_eq!(
-            body["stream"], true,
+        assert!(
+            body["stream"].as_bool().unwrap_or(false),
             "free-tier wire body must stream: {body}"
         );
         let mut names = wire_tool_names(&body, WireFormat::ChatCompletions);

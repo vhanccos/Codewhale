@@ -237,7 +237,8 @@ pub(crate) fn credential_state_for_provider(
     if crate::config::provider_route_is_keyless_self_hosted(
         provider,
         &config.base_url_for_route(provider),
-    ) || (provider == ApiProvider::OpencodeZen && official_endpoint) {
+    ) || (provider == ApiProvider::OpencodeZen && official_endpoint)
+    {
         return if api_key_required {
             if crate::config::has_api_key_for(config, provider) {
                 CredentialState::Saved
