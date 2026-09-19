@@ -7316,7 +7316,18 @@ impl Config {
                 anyhow::bail!("{}", missing_provider_api_key_message(provider)?)
             }
             ApiProvider::OpencodeZen => {
-                anyhow::bail!("{}", missing_provider_api_key_message(provider)?)
+                // The official Zen endpoint serves a keyless free tier: no key
+                // found means an empty key, and the client omits the
+                // Authorization header. Custom endpoints never inherit the
+                // official keyless tier, and an explicit API-key auth contract
+                // still fails loud instead of silently going keyless.
+                if auth_mode_requires_api_key(auth_mode.as_deref())
+                    || self.provider_uses_custom_endpoint(provider)
+                {
+                    anyhow::bail!("{}", missing_provider_api_key_message(provider)?)
+                } else {
+                    Ok(String::new())
+                }
             }
             ApiProvider::OpenaiCodex => anyhow::bail!(
                 "{}",
@@ -12291,6 +12302,10 @@ impl Config {
 /// this up," so a self-hosted provider only qualifies via an explicit
 /// `[providers.<name>]` entry or being active, never via `has_key` alone
 /// (otherwise every self-hosted provider type would always show up).
+/// OpenCode Zen follows the same rule for its keyless free tier: routable
+/// without a key, but configured only when active or explicitly set up —
+/// otherwise it would shadow explicitly credentialed providers that serve
+/// the same models.
 #[must_use]
 pub(crate) fn provider_is_configured(
     provider: ApiProvider,
@@ -12309,7 +12324,7 @@ pub(crate) fn provider_is_configured(
     if configured.is_some_and(provider_config_is_explicit) {
         return true;
     }
-    if provider.is_self_hosted() {
+    if provider.is_self_hosted() || provider == ApiProvider::OpencodeZen {
         return false;
     }
     has_key

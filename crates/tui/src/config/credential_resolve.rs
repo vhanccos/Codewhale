@@ -600,4 +600,56 @@ mod tests {
             "has_api_key_for re-resolves through the same consented read; still no write/refresh/network"
         );
     }
+
+    /// Anonymous Zen is not a credential: with no key anywhere the route
+    /// resolves as missing, so an unconfigured Zen never outranks explicitly
+    /// credentialed providers that serve the same models. The keyless free
+    /// tier runs through explicit selection, where the request path resolves
+    /// an empty key instead of failing.
+    #[test]
+    fn opencode_zen_without_any_credential_stays_missing() {
+        let _lock = lock_test_env();
+        let home = tempfile::tempdir().expect("credential fixture");
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", home.path());
+        let ctx = MapAuthContext::new();
+        let config = Config::default();
+        let resolution = resolve_credential_source_with(&config, ApiProvider::OpencodeZen, &ctx);
+        assert!(!resolution.is_present());
+    }
+
+    /// An explicit API-key auth contract opts back into failing loud.
+    #[test]
+    fn opencode_zen_explicit_api_key_contract_stays_missing_without_a_key() {
+        let _lock = lock_test_env();
+        let home = tempfile::tempdir().expect("credential fixture");
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", home.path());
+        let ctx = MapAuthContext::new();
+        let config = Config {
+            providers: Some(
+                toml::from_str("[opencode_zen]\nauth_mode = \"api_key\"\n")
+                    .expect("provider table"),
+            ),
+            ..Config::default()
+        };
+        let resolution = resolve_credential_source_with(&config, ApiProvider::OpencodeZen, &ctx);
+        assert!(!resolution.is_present());
+    }
+
+    /// Custom endpoints never inherit the official endpoint's keyless tier.
+    #[test]
+    fn opencode_zen_custom_endpoint_stays_missing_without_a_key() {
+        let _lock = lock_test_env();
+        let home = tempfile::tempdir().expect("credential fixture");
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", home.path());
+        let ctx = MapAuthContext::new();
+        let config = Config {
+            providers: Some(
+                toml::from_str("[opencode_zen]\nbase_url = \"https://zen.example/v1\"\n")
+                    .expect("provider table"),
+            ),
+            ..Config::default()
+        };
+        let resolution = resolve_credential_source_with(&config, ApiProvider::OpencodeZen, &ctx);
+        assert!(!resolution.is_present());
+    }
 }

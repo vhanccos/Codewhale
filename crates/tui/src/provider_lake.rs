@@ -862,6 +862,33 @@ pub(crate) fn runtime_catalog_resolver_for_identity(
         offering.default_for_provider = true;
     }
 
+    // OpenCode Zen serves Muse Spark exclusively over Responses. Live
+    // id-only rows (Models.dev, gateway rosters) default to `endpoint_key:
+    // "chat"` because existence is all they prove, so a new muse-spark id
+    // (e.g. muse-spark-1.3-contributor-free) would resolve to Chat while the
+    // gateway answers that wire with a deterministic 500 (verified live:
+    // Chat 500s on every attempt, Responses streams). Curated bundled rows
+    // already say responses, so this only repairs defaulted rows. Mirrors
+    // the resolver's muse-spark fail-open in codewhale-config
+    // `route/resolver.rs`; keep the two in sync.
+    //
+    // Known limitation: other future Zen-only-protocol families have no such
+    // rule and still resolve from the defaulted key until curated.
+    if provider == ApiProvider::OpencodeZen {
+        for offering in route_offerings.values_mut() {
+            if offering.provider.as_str() == catalog_id.as_ref()
+                && offering
+                    .wire_model_id
+                    .as_str()
+                    .to_ascii_lowercase()
+                    .contains("muse-spark")
+                && offering.endpoint_key != "responses"
+            {
+                offering.endpoint_key = "responses".to_string();
+            }
+        }
+    }
+
     let resolver = RouteResolver::from_offerings(route_offerings.into_values().collect());
     if let Ok(mut cache) = RUNTIME_RESOLVER_CACHE.write() {
         cache.insert(
@@ -2591,6 +2618,55 @@ mod tests {
     }
 
     #[test]
+    /// A live id-only Models.dev row for a new muse-spark id defaults to
+    /// `endpoint_key: "chat"` (existence is all it proves). Without the
+    /// curated correction the runtime resolver hands that row to the
+    /// Chat wire and the Zen gateway answers a deterministic 500 — the
+    /// bundled 1.2 rows already say responses, so only defaulted rows move.
+    #[test]
+    fn opencode_zen_lake_repairs_defaulted_chat_key_for_new_muse_spark_ids() {
+        use codewhale_config::route::{LogicalModelRef, RequestProtocol, RouteRequest};
+
+        let _live = lock_live_snapshot();
+        clear_live_snapshot();
+        set_live_snapshot(
+            CatalogSnapshot {
+                offerings: vec![CatalogOffering {
+                    provider: "opencode-zen".to_string(),
+                    wire_model_id: "muse-spark-1.3-contributor-free".to_string(),
+                    endpoint_key: "chat".to_string(),
+                    ..Default::default()
+                }],
+            },
+            LiveSource::ModelsDev,
+        );
+
+        let catalog = runtime_catalog_resolver_for_identity(
+            ApiProvider::OpencodeZen,
+            Some("opencode-zen"),
+            "https://opencode.ai/zen/v1",
+            codewhale_config::catalog::CatalogStatus::Unknown,
+        );
+        let route = catalog
+            .resolver
+            .resolve(&RouteRequest {
+                explicit_provider: Some(codewhale_config::ProviderKind::OpencodeZen),
+                model_selector: Some(LogicalModelRef::from("muse-spark-1.3-contributor-free")),
+                saved_provider_model: None,
+                base_url_override: None,
+                limit_overrides: Vec::new(),
+            })
+            .expect("new muse-spark id resolves");
+        assert_eq!(
+            route.protocol(),
+            RequestProtocol::Responses,
+            "a defaulted live chat row must not send a Responses-only model to Chat"
+        );
+        assert_eq!(route.endpoint().endpoint_key, "responses");
+
+        clear_live_snapshot();
+    }
+
     fn opencode_go_lake_corrects_stale_protocols_in_saved_and_live_rows() {
         let _live = lock_live_snapshot();
         clear_live_snapshot();
