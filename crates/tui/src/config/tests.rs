@@ -866,6 +866,27 @@ fn opencode_zen_active_route_without_key_resolves_empty_key() -> Result<()> {
 }
 
 #[test]
+fn opencode_zen_custom_endpoint_without_key_still_fails() {
+    // Custom endpoints never inherit the official keyless tier: without a
+    // key the request path fails loud instead of sending an unauthenticated
+    // request at an endpoint that expects one.
+    let _lock = lock_test_env();
+    let home = tempfile::tempdir().unwrap();
+    let _home = EnvVarGuard::set("CODEWHALE_HOME", home.path());
+    let _zen = EnvVarGuard::remove("OPENCODE_ZEN_API_KEY");
+    let _fallback = EnvVarGuard::remove("OPENCODE_API_KEY");
+    let config = Config {
+        provider: Some("opencode-zen".to_string()),
+        providers: Some(
+            toml::from_str("[opencode_zen]\nbase_url = \"https://zen.example/v1\"\n")
+                .expect("provider table"),
+        ),
+        ..Config::default()
+    };
+    assert!(config.active_route_api_key().is_err());
+}
+
+#[test]
 fn opencode_zen_explicit_api_key_contract_still_requires_a_key() {
     let _lock = lock_test_env();
     let home = tempfile::tempdir().unwrap();

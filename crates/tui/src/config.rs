@@ -7294,9 +7294,12 @@ impl Config {
             ApiProvider::OpencodeZen => {
                 // The official Zen endpoint serves a keyless free tier: no key
                 // found means an empty key, and the client omits the
-                // Authorization header. An explicit API-key auth contract
+                // Authorization header. Custom endpoints never inherit the
+                // official keyless tier, and an explicit API-key auth contract
                 // still fails loud instead of silently going keyless.
-                if auth_mode_requires_api_key(auth_mode.as_deref()) {
+                if auth_mode_requires_api_key(auth_mode.as_deref())
+                    || self.provider_uses_custom_endpoint(provider)
+                {
                     anyhow::bail!("{}", missing_provider_api_key_message(provider)?)
                 } else {
                     Ok(String::new())

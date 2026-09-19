@@ -794,6 +794,7 @@ impl ProviderDashboardRow {
                 configured,
                 &provider_id,
                 &credential_resolution,
+                !config.provider_uses_custom_endpoint(provider),
             ));
         }
         if catalog_status == ProviderCatalogStatus::DefaultOnly {
@@ -1457,11 +1458,19 @@ fn missing_auth_message(
     configured: Option<&crate::config::ProviderConfig>,
     provider_id: &str,
     resolution: &crate::credentials::CredentialResolution,
+    official_endpoint: bool,
 ) -> String {
     if provider == ApiProvider::Moonshot
         && configured.is_some_and(crate::config::provider_config_uses_kimi_imported_token)
     {
         return "Kimi OAuth is unavailable; configure a Kimi API key".to_string();
+    }
+    // OpenCode Zen serves a keyless free tier on its official endpoint, so
+    // "no key found" is not a blocker there — only paid models need a key.
+    // Custom endpoints never inherit the official keyless tier and keep the
+    // strict missing-key message.
+    if provider == ApiProvider::OpencodeZen && official_endpoint {
+        return "No API key set — the Zen free tier works without one (use a *-free model). For paid models: export OPENCODE_ZEN_API_KEY=<key>".to_string();
     }
     let headline = if provider == ApiProvider::Custom {
         match configured
@@ -3156,6 +3165,19 @@ impl ProviderPickerView {
             ))]
         };
         if !oauth_provider {
+            if row.provider == ApiProvider::OpencodeZen
+                && !self
+                    .route_config
+                    .provider_uses_custom_endpoint(ApiProvider::OpencodeZen)
+                && self.api_key_input.trim().is_empty()
+            {
+                // The official free tier needs no key: say so where the key
+                // is asked, matching the empty-Enter keyless continue above.
+                hint_lines.push(Line::from(Span::styled(
+                    "Free tier needs no key: Enter continues without one; paste a key only for paid models.",
+                    Style::default().fg(palette::TEXT_MUTED),
+                )));
+            }
             if row.provider == ApiProvider::Moonshot
                 && crate::config::moonshot_base_url_is_exact_kimi_code(&row.base_url)
             {
@@ -4279,6 +4301,24 @@ impl ModalView for ProviderPickerView {
                     }
                     let key = self.api_key_input.trim().to_string();
                     if key.is_empty() {
+                        // OpenCode Zen's official free tier needs no key: an
+                        // empty submit selects the provider keyless instead of
+                        // stalling in key entry (the request path omits
+                        // Authorization). Custom endpoints never inherit the
+                        // official keyless tier, so they stay put here and
+                        // keep requiring a key.
+                        if self.selected_provider() == ApiProvider::OpencodeZen
+                            && !self
+                                .route_config
+                                .provider_uses_custom_endpoint(ApiProvider::OpencodeZen)
+                        {
+                            let provider = self.selected_provider();
+                            let provider_id = self.selected_provider_id();
+                            return ViewAction::EmitAndClose(ViewEvent::ProviderPickerApplied {
+                                provider,
+                                provider_id,
+                            });
+                        }
                         // Stay in key-entry; the user can press Esc to abort.
                         ViewAction::None
                     } else {
@@ -7047,6 +7087,96 @@ mod tests {
                 .into_iter()
                 .all(|(_, row)| row.provider.is_self_hosted())
         );
+    }
+
+    #[test]
+    fn opencode_zen_missing_note_names_the_keyless_free_tier() {
+        let missing = crate::credentials::CredentialResolution::missing(Vec::new());
+        let note = missing_auth_message(
+            ApiProvider::OpencodeZen,
+            None,
+            "opencode-zen",
+            &missing,
+            true,
+        );
+        assert!(
+            note.contains("free tier") && note.contains("OPENCODE_ZEN_API_KEY"),
+            "official Zen must explain keyless free tier, not demand a key: {note}"
+        );
+        let strict = missing_auth_message(
+            ApiProvider::OpencodeZen,
+            None,
+            "opencode-zen",
+            &missing,
+            false,
+        );
+        assert!(
+            strict.contains("missing") && strict.contains("fix:"),
+            "custom Zen endpoints keep the strict missing-key message: {strict}"
+        );
+    }
+
+    #[test]
+    fn opencode_zen_empty_key_entry_continues_keyless_on_official_endpoint() {
+        let _global_env = crate::test_support::lock_test_env();
+        let home = tempfile::tempdir().expect("isolated provider catalog home");
+        let _home = EnvVarGuard::set("HOME", home.path().to_string_lossy().as_ref());
+        let _secret_backend = EnvVarGuard::set("CODEWHALE_SECRET_BACKEND", "file");
+        let config = Config::default();
+        let mut picker = ProviderPickerView::new_for_onboarding(
+            ApiProvider::Deepseek,
+            Some(ApiProvider::OpencodeZen),
+            &config,
+            None,
+        );
+        assert_eq!(picker.selected_provider(), ApiProvider::OpencodeZen);
+        // List Enter still lands on key entry (paid onboarding unchanged).
+        assert!(matches!(
+            picker.handle_key(key(KeyCode::Enter)),
+            ViewAction::None
+        ));
+        assert_eq!(picker.stage, Stage::KeyEntry);
+        // Empty Enter selects the provider keyless instead of stalling.
+        match picker.handle_key(key(KeyCode::Enter)) {
+            ViewAction::EmitAndClose(ViewEvent::ProviderPickerApplied { provider, .. }) => {
+                assert_eq!(provider, ApiProvider::OpencodeZen)
+            }
+            other => panic!("empty Zen key entry must apply keyless, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn opencode_zen_empty_key_entry_still_requires_a_key_on_custom_endpoint() {
+        let _global_env = crate::test_support::lock_test_env();
+        let home = tempfile::tempdir().expect("isolated provider catalog home");
+        let _home = EnvVarGuard::set("HOME", home.path().to_string_lossy().as_ref());
+        let _secret_backend = EnvVarGuard::set("CODEWHALE_SECRET_BACKEND", "file");
+        let config = Config {
+            providers: Some(crate::config::ProvidersConfig {
+                opencode_zen: crate::config::ProviderConfig {
+                    base_url: Some("https://zen.example/v1".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Config::default()
+        };
+        let mut picker = ProviderPickerView::new_for_onboarding(
+            ApiProvider::Deepseek,
+            Some(ApiProvider::OpencodeZen),
+            &config,
+            None,
+        );
+        assert!(matches!(
+            picker.handle_key(key(KeyCode::Enter)),
+            ViewAction::None
+        ));
+        assert_eq!(picker.stage, Stage::KeyEntry);
+        assert!(
+            matches!(picker.handle_key(key(KeyCode::Enter)), ViewAction::None),
+            "custom Zen endpoints never inherit the official keyless tier"
+        );
+        assert_eq!(picker.stage, Stage::KeyEntry);
     }
 
     #[test]
