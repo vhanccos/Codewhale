@@ -7292,7 +7292,15 @@ impl Config {
                 anyhow::bail!("{}", missing_provider_api_key_message(provider)?)
             }
             ApiProvider::OpencodeZen => {
-                anyhow::bail!("{}", missing_provider_api_key_message(provider)?)
+                // The official Zen endpoint serves a keyless free tier: no key
+                // found means an empty key, and the client omits the
+                // Authorization header. An explicit API-key auth contract
+                // still fails loud instead of silently going keyless.
+                if auth_mode_requires_api_key(auth_mode.as_deref()) {
+                    anyhow::bail!("{}", missing_provider_api_key_message(provider)?)
+                } else {
+                    Ok(String::new())
+                }
             }
             ApiProvider::OpenaiCodex => anyhow::bail!(
                 "{}",

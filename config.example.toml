@@ -834,6 +834,8 @@ max_subagents = 10 # optional (default 64, clamped to 1-128)
 # Messages, and DeepSeek/MiniMax/GLM/Kimi/Grok/free models use Chat Completions.
 # Gemini uses a Google-specific protocol that Codewhale does not implement and
 # therefore fails closed instead of being sent with the wrong request shape.
+# No API key is required: the free tier works keyless (requests then omit the
+# Authorization header). Set a key only to use paid models.
 # Env vars: OPENCODE_ZEN_API_KEY (preferred), OPENCODE_API_KEY,
 # OPENCODE_ZEN_BASE_URL, OPENCODE_ZEN_MODEL
 [providers.opencode_zen]

@@ -841,6 +841,49 @@ fn opencode_zen_missing_credentials_never_mentions_codex_oauth() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn opencode_zen_active_route_without_key_resolves_empty_key() -> Result<()> {
+    // The official Zen endpoint serves a keyless free tier: with no key
+    // anywhere, the route resolves to an empty key (the client then omits
+    // the Authorization header) instead of failing.
+    let _lock = lock_test_env();
+    let home = tempfile::tempdir().unwrap();
+    let _home = EnvVarGuard::set("CODEWHALE_HOME", home.path());
+    let _zen = EnvVarGuard::remove("OPENCODE_ZEN_API_KEY");
+    let _fallback = EnvVarGuard::remove("OPENCODE_API_KEY");
+    let config = Config {
+        provider: Some("opencode-zen".to_string()),
+        ..Config::default()
+    };
+    assert_eq!(config.active_route_api_key()?, "");
+    assert!(
+        has_api_key_for(&config, ApiProvider::OpencodeZen),
+        "a keyless Zen route still counts as credentialed"
+    );
+    Ok(())
+}
+
+#[test]
+fn opencode_zen_explicit_api_key_contract_still_requires_a_key() {
+    let _lock = lock_test_env();
+    let home = tempfile::tempdir().unwrap();
+    let _home = EnvVarGuard::set("CODEWHALE_HOME", home.path());
+    let _zen = EnvVarGuard::remove("OPENCODE_ZEN_API_KEY");
+    let _fallback = EnvVarGuard::remove("OPENCODE_API_KEY");
+    let config = Config {
+        provider: Some("opencode-zen".to_string()),
+        providers: Some(
+            toml::from_str("[opencode_zen]\nauth_mode = \"api_key\"\n").expect("provider table"),
+        ),
+        ..Config::default()
+    };
+    assert!(
+        config.active_route_api_key().is_err(),
+        "an explicit API-key contract must fail loud instead of silently going keyless"
+    );
+    assert!(!has_api_key_for(&config, ApiProvider::OpencodeZen));
+}
+
 // GHSA-72w5-pf8h-xfp4 — regression: `allow_shell` must be opt-in.
 #[test]
 fn allow_shell_defaults_to_false_when_unset() {

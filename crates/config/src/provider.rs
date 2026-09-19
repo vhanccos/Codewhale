@@ -456,7 +456,7 @@ pub const fn credential_help(kind: ProviderKind) -> CredentialHelp {
             acquisition: ApiKey,
             credential_url: Some("https://opencode.ai/zen/"),
             docs_url: Some("https://opencode.ai/docs/zen/"),
-            guidance: "Create or copy an OpenCode Zen API key from OpenCode Zen.",
+            guidance: "Optional: the Zen free tier works without a key. Create or copy an OpenCode Zen API key from OpenCode Zen to use paid models.",
         },
         ProviderKind::Meta => CredentialHelp {
             acquisition: ApiKey,

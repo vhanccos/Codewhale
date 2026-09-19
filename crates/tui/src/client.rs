@@ -43,7 +43,7 @@ mod catalog_tests;
 use crate::logging;
 use codewhale_models::Role;
 use codewhale_models::{
-    ContentBlock, Message, MessageRequest, MessageResponse, SystemPrompt, Usage,
+    ContentBlock, Message, MessageRequest, MessageResponse, SystemPrompt, Tool, Usage,
 };
 
 /// Every provider request that can feed the interactive TUI's attached CWC run
@@ -356,6 +356,14 @@ const ALLOW_INSECURE_HTTP_ENV: &str = "CODEWHALE_ALLOW_INSECURE_HTTP";
 /// Legacy alias for [`ALLOW_INSECURE_HTTP_ENV`].
 const LEGACY_ALLOW_INSECURE_HTTP_ENV: &str = "DEEPSEEK_ALLOW_INSECURE_HTTP";
 
+/// User-Agent the OpenCode gateways accept.
+///
+/// Ported from `~/.pi/agent/extensions/opencode-fix.ts`: the Zen/Go
+/// anti-abuse validation only accepts requests that look like the official
+/// OpenCode client. This pins the client version the gateway accepts — bump
+/// it deliberately when the gateway moves, never to CodeWhale's own version.
+const OPENCODE_USER_AGENT: &str = "opencode/1.18.23";
+
 fn client_user_agent(api_provider: ApiProvider) -> &'static str {
     // The ChatGPT Codex backend is the sole route with a documented
     // compatibility exception. Kimi Code, including K3, must keep the normal
@@ -366,6 +374,11 @@ fn client_user_agent(api_provider: ApiProvider) -> &'static str {
             env!("CARGO_PKG_VERSION"),
             ")"
         )
+    } else if matches!(
+        api_provider,
+        ApiProvider::OpencodeGo | ApiProvider::OpencodeZen
+    ) {
+        OPENCODE_USER_AGENT
     } else {
         concat!(
             "Mozilla/5.0 (compatible; codewhale/",
@@ -1986,6 +1999,99 @@ impl CodewhaleClient {
     }
 }
 
+/// Stable OpenCode gateway session ID, generated once per process.
+/// See [`generate_opencode_session_id`].
+static OPENCODE_SESSION: OnceLock<String> = OnceLock::new();
+
+/// Generate one gateway session ID in the official `ses_` shape.
+///
+/// Port of `generateOpenCodeSessionId` in
+/// `~/.pi/agent/extensions/opencode-fix.ts`: `ses_` + 12 lowercase hex chars
+/// of the bitwise-inverted millisecond timestamp (48-bit mask) + 14 base62
+/// chars, for an exact total of 30 chars. The gateway rejects anything else
+/// (a UUID v4, for example). Randomness comes from a UUID v4 instead of
+/// `Math.random` so no new dependency is needed.
+fn generate_opencode_session_id() -> String {
+    const ALPHABET: &[u8; 62] =
+        b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0);
+    let inverted = (!(now_ms << 12 | 1)) & 0xFFFF_FFFF_FFFF;
+    let hex = format!("{inverted:012x}");
+    let random = uuid::Uuid::new_v4().into_bytes();
+    let mut suffix = String::with_capacity(14);
+    for byte in random.iter().take(14) {
+        suffix.push(ALPHABET[(byte % 62) as usize] as char);
+    }
+    format!("ses_{hex}{suffix}")
+}
+
+/// Whether a session value already carries the official gateway shape:
+/// exactly 30 chars starting with `ses_`.
+fn is_valid_opencode_session_id(session: &str) -> bool {
+    session.len() == 30 && session.starts_with("ses_")
+}
+
+/// Tool names the OpenCode gateways require free-tier requests to declare.
+const OPENCODE_AGENT_TOOL_NAMES: [&str; 4] = ["bash", "glob", "grep", "read"];
+
+/// Whether `model` targets the OpenCode free tier (e.g. `deepseek-v4-flash-free`).
+fn is_opencode_free_tier_model(model: &str) -> bool {
+    model.to_ascii_lowercase().contains("free")
+}
+
+/// Pad a free-tier gateway request with the official agent tools it is missing.
+///
+/// Mirrors `~/.pi/agent/extensions/opencode-fix.ts`: only absent names are
+/// appended, so CodeWhale's own `bash`/`read` tools (and any other real tools
+/// the turn already carries) are never duplicated. A dangling `tool_choice`
+/// without tools is already unroutable, so it is left alone instead of being
+/// activated against stubs the caller never meant.
+fn ensure_opencode_agent_tools(tools: &mut Option<Vec<Tool>>, has_tool_choice: bool) {
+    match tools {
+        None if has_tool_choice => {}
+        None => {
+            *tools = Some(
+                OPENCODE_AGENT_TOOL_NAMES
+                    .iter()
+                    .copied()
+                    .map(opencode_agent_stub_tool)
+                    .collect(),
+            );
+        }
+        Some(existing) => {
+            for name in OPENCODE_AGENT_TOOL_NAMES {
+                if !existing.iter().any(|tool| tool.name == name) {
+                    existing.push(opencode_agent_stub_tool(name));
+                }
+            }
+        }
+    }
+}
+
+/// One non-executable gateway-appeasement tool.
+///
+/// The free tier validates the tool *name*; only `glob`/`grep` ever reach
+/// this stub shape in practice, because CodeWhale's own catalog already owns
+/// `bash`/`read`. The description says so outright: if the model calls the
+/// stub, the turn fails that call instead of silently running the wrong tool.
+fn opencode_agent_stub_tool(name: &str) -> Tool {
+    Tool {
+        tool_type: None,
+        name: name.to_string(),
+        description: "OpenCode gateway compatibility declaration; not executable. Use file_search for file discovery and content search."
+            .to_string(),
+        input_schema: serde_json::json!({"type": "object", "properties": {}}),
+        allowed_callers: None,
+        defer_loading: None,
+        input_examples: None,
+        strict: None,
+        cache_control: None,
+    }
+}
+
 fn build_default_headers(
     api_key: &str,
     extra_headers: &HashMap<String, String>,
@@ -2054,19 +2160,26 @@ fn build_default_headers(
             HeaderValue::from_static("Codewhale"),
         );
     }
-    // OpenCode Go / OpenCode Zen gateways (https://opencode.ai/docs/go/)
-    // ask clients to send a stable `x-opencode-session` header so the
-    // service can optimize prompt caching and attribute traffic to a
-    // conversation. Generate one UUID v4 per process so every request a
-    // session makes to the gateway shares a single ID ("one stable ID per
-    // conversation"). A user-configured header of the same name wins: the
-    // extra-header loop below overwrites this value.
-    if matches!(
+    // OpenCode Go / OpenCode Zen gateways (https://opencode.ai/docs/go/,
+    // https://opencode.ai/docs/zen/) expect three anti-abuse signals —
+    // ported from `~/.pi/agent/extensions/opencode-fix.ts`:
+    // * `User-Agent: opencode/<client>` (see [`client_user_agent`]), never
+    //   a third-party identity;
+    // * no `x-opencode-client` header, which would disclose a non-OpenCode
+    //   client and trip the same validation;
+    // * a stable `x-opencode-session` header in the official `ses_` 30-char
+    //   shape, so the service can optimize prompt caching and attribute
+    //   traffic to a conversation. One ID per process: every request a
+    //   session makes to the gateway shares it ("one stable ID per
+    //   conversation"). A user-configured header of the same name wins, as
+    //   long as it already carries a valid shape — an invalid value is
+    //   repaired below, never sent, because the gateway rejects it.
+    let is_opencode_gateway = matches!(
         api_provider,
         ApiProvider::OpencodeGo | ApiProvider::OpencodeZen
-    ) {
-        static OPENCODE_SESSION: OnceLock<String> = OnceLock::new();
-        let session = OPENCODE_SESSION.get_or_init(|| uuid::Uuid::new_v4().to_string());
+    );
+    if is_opencode_gateway {
+        let session = OPENCODE_SESSION.get_or_init(generate_opencode_session_id);
         headers.insert(
             HeaderName::from_static("x-opencode-session"),
             HeaderValue::from_str(session)?,
@@ -2076,6 +2189,9 @@ fn build_default_headers(
         let name = name.trim();
         let value = value.trim();
         if name.is_empty() || value.is_empty() {
+            continue;
+        }
+        if is_opencode_gateway && name.eq_ignore_ascii_case("x-opencode-client") {
             continue;
         }
         if auth_disabled && is_upstream_auth_header(name) {
@@ -2090,6 +2206,18 @@ fn build_default_headers(
             continue;
         }
         headers.insert(header_name, HeaderValue::from_str(value)?);
+    }
+    if is_opencode_gateway
+        && !headers
+            .get("x-opencode-session")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(is_valid_opencode_session_id)
+    {
+        let session = OPENCODE_SESSION.get_or_init(generate_opencode_session_id);
+        headers.insert(
+            HeaderName::from_static("x-opencode-session"),
+            HeaderValue::from_str(session)?,
+        );
     }
     Ok(headers)
 }
@@ -2452,6 +2580,26 @@ impl CodewhaleClient {
             for tool in tools {
                 tool.strict = None;
             }
+        }
+        // Free-tier OpenCode models reject requests that do not declare the
+        // official agent tools — same anti-abuse validation as the headers
+        // above, ported from `~/.pi/agent/extensions/opencode-fix.ts`. Paid
+        // gateway models serve fine without them, so only free-tier requests
+        // are padded, and only with the names that are missing: `bash` and
+        // `read` already exist in CodeWhale's own catalog and must never be
+        // duplicated or shadowed.
+        //
+        // Known limitation: `stream` is the caller's entry point, not a wire
+        // fact (see `CallerStreamMode` below). A non-streaming call cannot be
+        // upgraded to SSE inside the body, so free-tier auxiliary calls that
+        // do not stream stay best-effort. Every streaming entry point
+        // already sets `stream: true` in its dialect body.
+        if matches!(
+            self.api_provider,
+            ApiProvider::OpencodeGo | ApiProvider::OpencodeZen
+        ) && is_opencode_free_tier_model(&request.model)
+        {
+            ensure_opencode_agent_tools(&mut request.tools, request.tool_choice.is_some());
         }
         let requested_effort = request.reasoning_effort.clone();
         // Same value computed for the seam above.
@@ -7918,6 +8066,7 @@ mod tests {
             "originator",
             "chatgpt-account-id",
             "x-api-key",
+            "x-opencode-client",
         ] {
             assert!(
                 request.headers.get(forbidden).is_none(),
@@ -7938,7 +8087,12 @@ mod tests {
             request.headers.get(AUTHORIZATION).is_none(),
             "Zen Messages request must not include Authorization"
         );
-        for forbidden in ["openai-beta", "originator", "chatgpt-account-id"] {
+        for forbidden in [
+            "openai-beta",
+            "originator",
+            "chatgpt-account-id",
+            "x-opencode-client",
+        ] {
             assert!(
                 request.headers.get(forbidden).is_none(),
                 "Zen request must not include {forbidden}"
@@ -8031,13 +8185,25 @@ mod tests {
                     .and_then(|value| value.to_str().ok())
             };
             let observed_session = header("x-opencode-session").expect("stable session header");
-            assert!(!observed_session.is_empty());
+            assert!(
+                is_valid_opencode_session_id(observed_session),
+                "gateway session must carry the official ses_ shape: {observed_session}"
+            );
             if let Some(previous) = &session {
                 assert_eq!(observed_session, previous);
             }
             session = Some(observed_session.to_string());
-            assert!(header("user-agent").is_some_and(|value| value.contains("Codewhale") || value.contains("codewhale")));
-            for forbidden in ["openai-beta", "originator", "chatgpt-account-id"] {
+            assert_eq!(
+                header("user-agent"),
+                Some("opencode/1.18.23"),
+                "gateway requests must look like the official OpenCode client"
+            );
+            for forbidden in [
+                "openai-beta",
+                "originator",
+                "chatgpt-account-id",
+                "x-opencode-client",
+            ] {
                 assert!(
                     header(forbidden).is_none(),
                     "gateway requests cannot carry {forbidden}"
@@ -9590,7 +9756,10 @@ mod tests {
                 .expect("x-opencode-session must be present for OpenCode gateways")
                 .to_str()
                 .expect("session id must be valid utf-8");
-            assert!(!session.is_empty(), "session id must be non-empty");
+            assert!(
+                is_valid_opencode_session_id(session),
+                "session id must carry the official ses_ shape: {session}"
+            );
 
             // The gateway requires one stable ID per conversation: a second
             // request from the same process must reuse the same value.
@@ -9613,10 +9782,11 @@ mod tests {
 
     #[test]
     fn user_configured_opencode_session_header_wins() {
+        // A user value in the official shape overrides the generated default.
         let mut extra = HashMap::new();
         extra.insert(
             "x-opencode-session".to_string(),
-            "user-configured-id".to_string(),
+            "ses_abcdef012345Gh1jK2lM3nOp4Q".to_string(),
         );
         let headers = CodewhaleClient::default_headers_for_provider(
             "configured-key",
@@ -9629,9 +9799,38 @@ mod tests {
             headers
                 .get("x-opencode-session")
                 .and_then(|value| value.to_str().ok()),
-            Some("user-configured-id"),
-            "a user-configured x-opencode-session must override the default"
+            Some("ses_abcdef012345Gh1jK2lM3nOp4Q"),
+            "a valid user-configured x-opencode-session must override the default"
         );
+    }
+
+    #[test]
+    fn invalid_user_configured_opencode_session_is_repaired() {
+        // The gateway rejects anything but the ses_ shape, so an invalid
+        // user value is replaced with the valid process-stable default —
+        // never sent.
+        let mut extra = HashMap::new();
+        extra.insert(
+            "x-opencode-session".to_string(),
+            "user-configured-id".to_string(),
+        );
+        for api_provider in [ApiProvider::OpencodeGo, ApiProvider::OpencodeZen] {
+            let headers = CodewhaleClient::default_headers_for_provider(
+                "configured-key",
+                &extra,
+                api_provider,
+                "https://opencode.ai/zen/v1",
+            )
+            .expect("headers");
+            let repaired = headers
+                .get("x-opencode-session")
+                .and_then(|value| value.to_str().ok())
+                .expect("repaired session header");
+            assert!(
+                is_valid_opencode_session_id(repaired),
+                "{api_provider:?} must repair an invalid session value: {repaired}"
+            );
+        }
     }
 
     #[test]
@@ -9653,6 +9852,215 @@ mod tests {
                 "non-OpenCode provider {api_provider:?} must not send the session header"
             );
         }
+    }
+
+    #[test]
+    fn opencode_gateways_identify_as_the_official_client() {
+        assert_eq!(
+            client_user_agent(ApiProvider::OpencodeGo),
+            OPENCODE_USER_AGENT
+        );
+        assert_eq!(
+            client_user_agent(ApiProvider::OpencodeZen),
+            OPENCODE_USER_AGENT
+        );
+        assert_eq!(OPENCODE_USER_AGENT, "opencode/1.18.23");
+        assert!(
+            client_user_agent(ApiProvider::Deepseek).contains("codewhale/"),
+            "unrelated providers keep the CodeWhale identity"
+        );
+    }
+
+    #[test]
+    fn opencode_client_hint_header_is_stripped_for_gateways_only() {
+        for api_provider in [ApiProvider::OpencodeGo, ApiProvider::OpencodeZen] {
+            let mut extra = HashMap::new();
+            extra.insert("x-opencode-client".to_string(), "pi".to_string());
+            extra.insert("X-OpenCode-Client".to_string(), "pi".to_string());
+            let headers = CodewhaleClient::default_headers_for_provider(
+                "configured-key",
+                &extra,
+                api_provider,
+                "https://opencode.ai/zen/v1",
+            )
+            .expect("headers");
+            assert!(
+                headers.get("x-opencode-client").is_none(),
+                "{api_provider:?} must not disclose a non-OpenCode client"
+            );
+        }
+        // Scoped to the gateways: other providers keep a user-configured value.
+        let mut extra = HashMap::new();
+        extra.insert("x-opencode-client".to_string(), "pi".to_string());
+        let headers = CodewhaleClient::default_headers_for_provider(
+            "configured-key",
+            &extra,
+            ApiProvider::Deepseek,
+            "https://api.deepseek.com/v1",
+        )
+        .expect("headers");
+        assert_eq!(
+            headers
+                .get("x-opencode-client")
+                .and_then(|value| value.to_str().ok()),
+            Some("pi")
+        );
+    }
+
+    fn opencode_zen_body_client(model: &str) -> CodewhaleClient {
+        // No API key on purpose: the official Zen endpoint serves a keyless
+        // free tier, so client construction must not require one.
+        CodewhaleClient::new(&Config {
+            provider: Some("opencode-zen".to_string()),
+            providers: Some(ProvidersConfig {
+                opencode_zen: ProviderConfig {
+                    base_url: Some("https://opencode.ai/zen/v1".to_string()),
+                    model: Some(model.to_string()),
+                    ..ProviderConfig::default()
+                },
+                ..ProvidersConfig::default()
+            }),
+            ..Config::default()
+        })
+        .expect("OpenCode Zen client resolves its model route without an API key")
+    }
+
+    fn opencode_body_request(
+        model: &str,
+        tools: Option<Vec<Tool>>,
+        tool_choice: Option<Value>,
+    ) -> MessageRequest {
+        MessageRequest {
+            model: model.to_string(),
+            messages: vec![Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: "free-tier fixture".to_string(),
+                    cache_control: None,
+                }],
+            }],
+            max_tokens: 64,
+            system: None,
+            tools,
+            tool_choice,
+            metadata: None,
+            thinking: None,
+            reasoning_effort: Some("off".to_string()),
+            stream: Some(false),
+            temperature: None,
+            top_p: None,
+        }
+    }
+
+    fn wire_tool_names(body: &Value, wire: WireFormat) -> Vec<String> {
+        body["tools"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|tool| {
+                if wire == WireFormat::ChatCompletions {
+                    tool.pointer("/function/name")
+                } else {
+                    tool.get("name")
+                }
+                .and_then(Value::as_str)
+                .unwrap_or("<unnamed>")
+                .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn opencode_free_tier_chat_request_declares_agent_tools() {
+        let client = opencode_zen_body_client("deepseek-v4-flash-free");
+        assert_eq!(client.wire_format, WireFormat::ChatCompletions);
+        let prepared = client
+            .prepare_outbound_request(
+                opencode_body_request("deepseek-v4-flash-free", None, None),
+                false,
+            )
+            .expect("free-tier request prepares");
+        let mut names = wire_tool_names(&prepared.body, WireFormat::ChatCompletions);
+        names.sort();
+        assert_eq!(names, ["bash", "glob", "grep", "read"]);
+    }
+
+    #[test]
+    fn opencode_free_tier_responses_request_declares_agent_tools() {
+        let client = opencode_zen_body_client("muse-spark-1.2-contributor-free");
+        assert_eq!(client.wire_format, WireFormat::Responses);
+        let prepared = client
+            .prepare_outbound_request(
+                opencode_body_request("muse-spark-1.2-contributor-free", None, None),
+                true,
+            )
+            .expect("free-tier request prepares");
+        let mut names = wire_tool_names(&prepared.body, WireFormat::Responses);
+        names.sort();
+        assert_eq!(names, ["bash", "glob", "grep", "read"]);
+        assert!(
+            prepared.body.get("input").is_some(),
+            "Responses shape must be preserved: {}",
+            prepared.body
+        );
+    }
+
+    #[test]
+    fn opencode_free_tier_keeps_real_tools_and_adds_only_missing() {
+        let client = opencode_zen_body_client("deepseek-v4-flash-free");
+        let mut bash = test_tool("bash");
+        bash.strict = None;
+        let mut read = test_tool("read");
+        read.strict = None;
+        let prepared = client
+            .prepare_outbound_request(
+                opencode_body_request("deepseek-v4-flash-free", Some(vec![bash, read]), None),
+                false,
+            )
+            .expect("free-tier request prepares");
+        let names = wire_tool_names(&prepared.body, WireFormat::ChatCompletions);
+        for required in ["bash", "glob", "grep", "read"] {
+            assert_eq!(
+                names.iter().filter(|name| *name == required).count(),
+                1,
+                "tool {required} must appear exactly once: {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn opencode_paid_model_request_is_not_padded() {
+        let client = opencode_zen_body_client("deepseek-v4-pro");
+        assert_eq!(client.wire_format, WireFormat::ChatCompletions);
+        let prepared = client
+            .prepare_outbound_request(opencode_body_request("deepseek-v4-pro", None, None), false)
+            .expect("paid request prepares");
+        assert!(
+            prepared.body.get("tools").is_none(),
+            "paid gateway models must not gain appeasement tools: {}",
+            prepared.body
+        );
+    }
+
+    #[test]
+    fn opencode_free_tier_leaves_dangling_tool_choice_alone() {
+        let client = opencode_zen_body_client("deepseek-v4-flash-free");
+        let prepared = client
+            .prepare_outbound_request(
+                opencode_body_request(
+                    "deepseek-v4-flash-free",
+                    None,
+                    Some(json!({"type": "auto"})),
+                ),
+                false,
+            )
+            .expect("free-tier request prepares");
+        assert!(
+            prepared.body.get("tools").is_none(),
+            "a tool_choice without tools is unroutable and must not be activated: {}",
+            prepared.body
+        );
     }
 
     #[test]
