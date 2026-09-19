@@ -569,10 +569,24 @@ impl CodewhaleClient {
         &self,
         prepared: &super::PreparedOutboundRequest,
     ) -> Result<MessageResponse> {
-        use futures_util::StreamExt;
+        let stream = self.handle_responses_stream(prepared).await?;
+        Self::collect_streamed_message(stream, prepared.wire_model.clone()).await
+    }
 
-        let model = prepared.wire_model.clone();
-        let mut stream = self.handle_responses_stream(prepared).await?;
+    /// Drain one provider SSE stream into a complete response.
+    ///
+    /// Shared by the Responses non-streaming entry point above and the
+    /// OpenCode free-tier upgrade in `create_message_with_cache_policy`: the
+    /// gateway rejects non-streaming free-tier requests ("can only be used
+    /// from within OpenCode"), so those run the streaming handler and
+    /// assemble here. The mapping is over the shared `StreamEvent` enum with
+    /// a catch-all arm, so Chat and Messages streams assemble without
+    /// dialect-specific code.
+    pub(super) async fn collect_streamed_message(
+        mut stream: StreamEventBox,
+        model: String,
+    ) -> Result<MessageResponse> {
+        use futures_util::StreamExt;
 
         let mut response = MessageResponse {
             id: String::new(),

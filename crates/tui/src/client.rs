@@ -2589,11 +2589,10 @@ impl CodewhaleClient {
         // `read` already exist in CodeWhale's own catalog and must never be
         // duplicated or shadowed.
         //
-        // Known limitation: `stream` is the caller's entry point, not a wire
-        // fact (see `CallerStreamMode` below). A non-streaming call cannot be
-        // upgraded to SSE inside the body, so free-tier auxiliary calls that
-        // do not stream stay best-effort. Every streaming entry point
-        // already sets `stream: true` in its dialect body.
+        // `stream` stays the caller's entry point here, never a wire fact
+        // (see `CallerStreamMode` below): `create_message_with_cache_policy`
+        // upgrades free-tier gateway calls to the streaming handler, so the
+        // body and the parser always agree.
         if matches!(
             self.api_provider,
             ApiProvider::OpencodeGo | ApiProvider::OpencodeZen
@@ -2979,6 +2978,41 @@ impl CodewhaleClient {
             "chat/completions",
             self.path_suffix.as_deref(),
         );
+        // Free-tier gateway translations must stream like every other
+        // free-tier call, so they reuse the upgraded `create_message` seam
+        // instead of the fixed non-streaming body below. Translations are
+        // never response-cached (`temperature` is unset), so routing them
+        // through the shared entry point changes no caching behavior.
+        if matches!(
+            self.api_provider,
+            ApiProvider::OpencodeGo | ApiProvider::OpencodeZen
+        ) && is_opencode_free_tier_model(&model)
+        {
+            let response = self
+                .create_message(translation_message_request(
+                    text,
+                    model,
+                    target_language,
+                    max_tokens,
+                ))
+                .await?;
+            let usage =
+                (response.usage != Usage::default()).then_some(response.usage.clone());
+            let translated =
+                if codewhale_models::is_incomplete_stop_reason(response.stop_reason.as_deref()) {
+                    Err(anyhow::anyhow!(
+                        "translate: provider response incomplete ({})",
+                        codewhale_models::stop_reason_detail(response.stop_reason.as_deref())
+                    ))
+                } else {
+                    translation_text_from_response(&response)
+                };
+            return Ok(TranslationProviderResponse {
+                translated,
+                route,
+                usage,
+            });
+        }
         let mut body = serde_json::json!({
             "model": model,
             "messages": [
@@ -3903,10 +3937,29 @@ impl CodewhaleClient {
         let _permit = self.acquire_provider_request_permit().await;
         let cacheable =
             allow_response_cache && crate::llm_response_cache::request_is_cacheable(&request);
-        let prepared = self.prepare_outbound_request(request, false)?;
+        // Free-tier OpenCode requests must stream: the gateway rejects
+        // non-streaming ones as "not from within OpenCode". The
+        // non-streaming entry point therefore runs the streaming handler and
+        // assembles the response — the same fold Responses applies to every
+        // call (see `collect_streamed_message`). The Responses wire always
+        // streams, so it needs no upgrade.
+        let free_tier_stream_upgrade = matches!(
+            self.api_provider,
+            ApiProvider::OpencodeGo | ApiProvider::OpencodeZen
+        ) && is_opencode_free_tier_model(&request.model);
+        let prepared = self.prepare_outbound_request(request, free_tier_stream_upgrade)?;
         match prepared.dialect {
             WireDialect::OpenAiResponses => self.handle_responses_message(&prepared).await,
+            WireDialect::AnthropicMessages if free_tier_stream_upgrade => {
+                let stream = self.handle_anthropic_stream(&prepared).await?;
+                Self::collect_streamed_message(stream, prepared.wire_model.clone()).await
+            }
             WireDialect::AnthropicMessages => self.handle_anthropic_message(&prepared).await,
+            WireDialect::ChatCompletions if free_tier_stream_upgrade => {
+                let wire_model = prepared.wire_model.clone();
+                let stream = self.handle_chat_completion_stream(prepared).await?;
+                Self::collect_streamed_message(stream, wire_model).await
+            }
             WireDialect::ChatCompletions => self.create_message_chat(&prepared, cacheable).await,
         }
     }
@@ -10060,6 +10113,74 @@ mod tests {
             prepared.body.get("tools").is_none(),
             "a tool_choice without tools is unroutable and must not be activated: {}",
             prepared.body
+        );
+    }
+
+    fn opencode_zen_mock_client(server: &MockServer, model: &str) -> CodewhaleClient {
+        // No API key on purpose: the official Zen endpoint serves a keyless
+        // free tier, so client construction must not require one.
+        CodewhaleClient::new(&Config {
+            provider: Some("opencode-zen".to_string()),
+            providers: Some(ProvidersConfig {
+                opencode_zen: ProviderConfig {
+                    base_url: Some(server.uri()),
+                    model: Some(model.to_string()),
+                    ..ProviderConfig::default()
+                },
+                ..ProvidersConfig::default()
+            }),
+            ..Config::default()
+        })
+        .expect("keyless Zen client resolves its model route")
+    }
+
+    #[tokio::test]
+    async fn opencode_free_tier_non_streaming_chat_upgrades_to_sse() {
+        // The gateway rejects non-streaming free-tier requests ("can only
+        // be used from within OpenCode"), so the non-streaming entry point
+        // must send `stream: true` and assemble the SSE response.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(concat!(
+                        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n",
+                        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                    )),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = opencode_zen_mock_client(&server, "deepseek-v4-flash-free");
+        let response = client
+            .create_message(opencode_body_request("deepseek-v4-flash-free", None, None))
+            .await
+            .expect("free-tier non-streaming request assembles from SSE");
+        assert!(
+            response.content.iter().any(|block| matches!(
+                block,
+                ContentBlock::Text { text, .. } if text == "ok"
+            )),
+            "assembled content must carry the streamed text: {:?}",
+            response.content
+        );
+
+        let requests = server.received_requests().await.expect("recorded request");
+        assert_eq!(requests.len(), 1);
+        let body: Value = serde_json::from_slice(&requests[0].body).expect("request JSON");
+        assert_eq!(
+            body["stream"], true,
+            "free-tier wire body must stream: {body}"
+        );
+        let mut names = wire_tool_names(&body, WireFormat::ChatCompletions);
+        names.sort();
+        assert_eq!(names, ["bash", "glob", "grep", "read"]);
+        assert!(
+            requests[0].headers.get("authorization").is_none(),
+            "keyless request must not carry Authorization"
         );
     }
 
